@@ -12,8 +12,7 @@ from telegram import (
     KeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardRemove,
-    CallbackQuery,
-    Message
+    CallbackQuery
 )
 from telegram.ext import (
     Application,
@@ -33,6 +32,12 @@ from urllib.parse import quote
 import re
 from typing import Dict, List, Optional, Union
 import html
+from prometheus_client import Counter, Histogram
+import schedule
+import time
+import threading
+import unittest
+import hashlib
 
 # Configure logging
 logging.basicConfig(
@@ -54,16 +59,8 @@ SELECTING_SEASON, SELECTING_EPISODE = range(2)
 class MovieBot:
     def __init__(self):
         self.application = Application.builder().token(TELEGRAM_TOKEN).build()
-        self.data_manager = DataManager()
-        self.rate_limiter = RateLimiter()
-        self.session_manager = SessionManager()
+        self.user_data = {}  # Store user preferences and history
         self.setup_handlers()
-        
-        # Start periodic tasks
-        self.application.job_queue.run_repeating(
-            self.cleanup_sessions,
-            interval=timedelta(minutes=30)
-        )
 
     def setup_handlers(self):
         # Command handlers
@@ -74,6 +71,9 @@ class MovieBot:
         self.application.add_handler(CommandHandler("nowplaying", self.now_playing_command))
         self.application.add_handler(CommandHandler("mylist", self.my_list_command))
         self.application.add_handler(CommandHandler("settings", self.settings_command))
+        self.application.add_handler(CommandHandler("feedback", self.handle_feedback))
+        self.application.add_handler(CommandHandler("guide", self.show_user_guide))
+        self.application.add_handler(CommandHandler("share", self.share_watchlist))
 
         # Callback query handler
         self.application.add_handler(CallbackQueryHandler(self.handle_callback))
@@ -104,14 +104,15 @@ class MovieBot:
             "🔍 You can start by:\n"
             "1. Using the commands below\n"
             "2. Simply typing a movie/show name\n"
-            "3. Using inline mode by typing @your_bot_name in any chat\n\n"
+            "3. Using inline mode by typing @DetectiveBatBot in any chat\n\n"
             "*Available Commands:*\n"
             "/trending - Get trending movies and shows\n"
             "/upcoming - View upcoming releases\n"
             "/nowplaying - See what's in theaters\n"
             "/mylist - Access your watchlist\n"
             "/settings - Customize your preferences\n"
-            "/help - Get detailed help"
+            "/help - Get detailed help\n\n"
+            "Developed by HRISH [@End_Of_James]"
         )
 
         keyboard = [
@@ -240,7 +241,7 @@ class MovieBot:
             sources = [
                 ("🎬 Source 1", f"https://vidsrc.dev/embed/movie/{item_id}"),
                 ("🎬 Source 2", f"https://embed.su/embed/movie/{item_id}"),
-                ("🎬 Source 3", f"https://vidsrc.me/embed/movie?imdb={item_id}")
+                ("🎬 Source 3", f"https://moviee.tv/embed/movie/{item_id}")
             ]
         else:
             season = season or 1
@@ -248,7 +249,7 @@ class MovieBot:
             sources = [
                 ("📺 Source 1", f"https://vidsrc.dev/embed/tv/{item_id}/{season}/{episode}"),
                 ("📺 Source 2", f"https://embed.su/embed/tv/{item_id}/{season}/{episode}"),
-                ("📺 Source 3", f"https://vidsrc.me/embed/tv?imdb={item_id}&season={season}&episode={episode}")
+                ("📺 Source 3", f"https://moviee.tv/embed/tv/{item_id}?season={season}&episode={episode}")
             ]
 
         return [InlineKeyboardButton(label, url=url) for label, url in sources]
@@ -277,8 +278,6 @@ class MovieBot:
                 await self.show_similar_content(query, context)
             elif data.startswith('menu_'):
                 await self.handle_menu_selection(query, context)
-            elif data.startswith('settings_'):
-                await self.handle_settings_callback(query, context)
         except Exception as e:
             logger.error(f"Error handling callback: {e}")
             await query.answer("An error occurred. Please try again.")
@@ -327,45 +326,54 @@ class MovieBot:
             'timestamp': datetime.now().isoformat()
         })
 
-    async def show_loading_message(self, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> Message:
-        """Show a loading message that can be deleted later"""
-        return await context.bot.send_message(
-            chat_id=chat_id,
-            text="🔄 Loading...",
-            parse_mode='Markdown'
+    async def handle_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Enhanced search handler with auto-complete and suggestions"""
+        search_query = update.message.text
+        
+        # Show typing indicator
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id,
+            action="typing"
         )
 
-    async def handle_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle search command and queries"""
-        query = ' '.join(context.args) if context.args else None
-        if not query:
+        search_results = await self.fetch_tmdb_data(
+            "/search/multi",
+            {"query": search_query, "page": 1}
+        )
+
+        if not search_results.get('results'):
             await update.message.reply_text(
-                "Please provide a search term.\nExample: `/search The Matrix`",
-                parse_mode='Markdown'
+                "🔍 No results found. Please try a different search term.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🏠 Back to Menu", callback_data="menu_main")
+                ]])
             )
             return
 
-        loading_message = await self.show_loading_message(update.message.chat_id, context)
-        
-        try:
-            results = await self.tmdb.search_multi(query)
-            if not results:
-                await loading_message.delete()
-                await update.message.reply_text(
-                    "❌ No results found. Try a different search term.",
-                    parse_mode='Markdown'
-                )
-                return
+        # Format results with images and details
+        results_message = "🔍 Search Results:\n\n"
+        keyboard = []
 
-            await loading_message.delete()
-            await self.display_search_results(update, context, results)
-        except Exception as e:
-            logger.error(f"Search error: {e}")
-            await loading_message.delete()
-            await update.message.reply_text(
-                "❌ An error occurred while searching. Please try again later.",
-                parse_mode='Markdown'
-            )
+        for item in search_results['results'][:8]:
+            media_type = item.get('media_type', 'movie')
+            title = item.get('title') or item.get('name')
+            year = (item.get('release_date') or item.get('first_air_date', ''))[:4]
+            rating = item.get('vote_average', 0)
+
+            if title:
+                results_message += f"• {title} ({year}) ⭐ {rating}/10\n"
+                callback_data = f"{media_type}_{item['id']}"
+                keyboard.append([InlineKeyboardButton(f"{title} ({year})", 
+                                                    callback_data=callback_data)])
+
+        keyboard.append([InlineKeyboardButton("🏠 Back to Menu", 
+                                            callback_data="menu_main")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.reply_text(
+            results_message,
+            reply_markup=reply_markup
+        )
 
     async def show_tv_details(self, query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE):
         """Show detailed TV show information with seasons and episodes"""
@@ -439,115 +447,118 @@ class MovieBot:
             await query.answer("Error displaying TV show details")
 
     async def handle_season_selection(self, query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE):
-        """Handle season selection for TV series"""
-        try:
-            # Parse the callback data
-            _, series_id, season_number = query.data.split('_')
-            
-            # Fetch season details from TMDB
-            season = await self.tmdb.get_tv_season(series_id, season_number)
-            if not season:
-                await query.answer("Season information not available!")
-                return
+        """Handle season selection with episode list"""
+        _, show_id, season_number = query.data.split('_')
+        
+        # Fetch season details
+        season_data = await self.fetch_tmdb_data(
+            f"/tv/{show_id}/season/{season_number}"
+        )
+        
+        if not season_data:
+            await query.answer("Season information not available")
+            return
 
-            # Create episode list buttons
-            keyboard = []
-            for episode in season.get('episodes', []):
-                episode_number = episode.get('episode_number')
-                episode_name = episode.get('name')
-                keyboard.append([
-                    InlineKeyboardButton(
-                        f"Episode {episode_number}: {episode_name}",
-                        callback_data=f"episode_{series_id}_{season_number}_{episode_number}"
-                    )
-                ])
+        # Format season information
+        message = (
+            f"📺 *Season {season_number}*\n"
+            f"📅 Air Date: {season_data.get('air_date', 'N/A')}\n"
+            f"episodes: {len(season_data.get('episodes', []))}\n\n"
+            f"Select an episode:"
+        )
 
-            # Add back button
-            keyboard.append([InlineKeyboardButton("🔙 Back to Seasons", callback_data=f"series_{series_id}")])
+        # Create episode selection buttons with pagination
+        episodes = season_data.get('episodes', [])
+        keyboard = []
+        
+        # Show episodes in groups of 5
+        page = context.user_data.get('episode_page', 0)
+        start_idx = page * 5
+        end_idx = start_idx + 5
+        
+        for episode in episodes[start_idx:end_idx]:
+            episode_num = episode.get('episode_number')
+            episode_name = episode.get('name', f'Episode {episode_num}')
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"Ep {episode_num}: {episode_name}",
+                    callback_data=f"episode_{show_id}_{season_number}_{episode_num}"
+                )
+            ])
 
-            reply_markup = InlineKeyboardMarkup(keyboard)
-
-            # Get season poster or use series poster as fallback
-            poster_path = season.get('poster_path')
-            if poster_path:
-                photo_url = f"https://image.tmdb.org/t/p/w500{poster_path}"
-            else:
-                # Fetch series details for fallback poster
-                series = await self.tmdb.get_tv_details(series_id)
-                photo_url = f"https://image.tmdb.org/t/p/w500{series.get('poster_path')}"
-
-            # Create season overview text
-            season_text = f"*Season {season_number}*\n\n"
-            season_text += f"*Air Date:* {season.get('air_date', 'N/A')}\n"
-            season_text += f"*Episodes:* {len(season.get('episodes', []))}\n\n"
-            season_text += season.get('overview', 'No overview available.')
-
-            # Delete the previous message and send a new one
-            await query.message.delete()
-            await context.bot.send_photo(
-                chat_id=query.message.chat_id,
-                photo=photo_url,
-                caption=season_text,
-                parse_mode='Markdown',
-                reply_markup=reply_markup
+        # Add navigation buttons if needed
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(
+                InlineKeyboardButton("⬅️ Previous", callback_data=f"page_{page-1}")
             )
-            await query.answer()
+        if end_idx < len(episodes):
+            nav_buttons.append(
+                InlineKeyboardButton("➡️ Next", callback_data=f"page_{page+1}")
+            )
+        if nav_buttons:
+            keyboard.append(nav_buttons)
 
-        except Exception as e:
-            logger.error(f"Error in season selection: {e}")
-            await query.answer("An error occurred while fetching season information.")
+        # Add back button
+        keyboard.append([
+            InlineKeyboardButton("🔙 Back to Seasons", callback_data=f"tv_{show_id}")
+        ])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.message.edit_text(
+            message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
 
     async def handle_episode_selection(self, query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE):
-        """Handle episode selection"""
-        try:
-            # Parse callback data
-            _, series_id, season_number, episode_number = query.data.split('_')
-            
-            # Fetch episode details
-            episode = await self.tmdb.get_tv_episode(series_id, season_number, episode_number)
-            if not episode:
-                await query.answer("Episode information not available!")
-                return
+        """Handle episode selection and show streaming sources"""
+        _, show_id, season_number, episode_number = query.data.split('_')
+        
+        # Fetch episode details
+        episode_data = await self.fetch_tmdb_data(
+            f"/tv/{show_id}/season/{season_number}/episode/{episode_number}"
+        )
+        
+        if not episode_data:
+            await query.answer("Episode information not available")
+            return
 
-            # Create episode details text
-            episode_text = f"*{episode.get('name')}*\n"
-            episode_text += f"Season {season_number}, Episode {episode_number}\n\n"
-            episode_text += f"*Air Date:* {episode.get('air_date', 'N/A')}\n"
-            episode_text += f"*Rating:* {episode.get('vote_average', 'N/A')}/10\n\n"
-            episode_text += episode.get('overview', 'No overview available.')
+        # Format episode information
+        message = (
+            f"📺 *Episode {episode_number}: {episode_data.get('name', 'N/A')}*\n\n"
+            f"📅 Air Date: {episode_data.get('air_date', 'N/A')}\n"
+            f"⭐ Rating: {episode_data.get('vote_average', 0)}/10\n\n"
+            f"📝 *Overview:*\n{episode_data.get('overview', 'No overview available.')}\n\n"
+            f"Select a streaming source:"
+        )
 
-            # Create keyboard with back button
-            keyboard = [[
-                InlineKeyboardButton(
-                    "🔙 Back to Season", 
-                    callback_data=f"season_{series_id}_{season_number}"
-                )
-            ]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-
-            # Get episode still or use season poster as fallback
-            still_path = episode.get('still_path')
-            if still_path:
-                photo_url = f"https://image.tmdb.org/t/p/w500{still_path}"
-            else:
-                # Fetch series details for fallback poster
-                series = await self.tmdb.get_tv_details(series_id)
-                photo_url = f"https://image.tmdb.org/t/p/w500{series.get('poster_path')}"
-
-            # Delete previous message and send new one
-            await query.message.delete()
-            await context.bot.send_photo(
-                chat_id=query.message.chat_id,
-                photo=photo_url,
-                caption=episode_text,
-                parse_mode='Markdown',
-                reply_markup=reply_markup
+        # Create streaming source buttons
+        source_buttons = await self.create_source_buttons(
+            show_id,
+            'tv',
+            int(season_number),
+            int(episode_number)
+        )
+        
+        keyboard = [source_buttons]
+        
+        # Add navigation buttons
+        keyboard.append([
+            InlineKeyboardButton(
+                "🔙 Back to Episodes",
+                callback_data=f"season_{show_id}_{season_number}"
             )
-            await query.answer()
+        ])
 
-        except Exception as e:
-            logger.error(f"Error in episode selection: {e}")
-            await query.answer("An error occurred while fetching episode information.")
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.message.edit_text(
+            message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
 
     async def handle_like(self, query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE):
         """Handle like button interactions"""
@@ -699,70 +710,14 @@ class MovieBot:
 
     async def settings_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /settings command"""
-        # Get the user ID from either Update or CallbackQuery
-        user_id = str(update.effective_user.id if isinstance(update, Update) else update.from_user.id)
-        
-        # Get current settings from data manager
-        settings = self.data_manager.get_settings(user_id)
-        
-        # Create settings keyboard
+        message = "⚙️ *Settings:*\n\nCustomize your preferences:"
         keyboard = [
-            [
-                InlineKeyboardButton(
-                    f" Language: {settings.get('language', 'en').upper()}", 
-                    callback_data="settings_language"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    f"🔞 Adult Content: {'✅' if settings.get('adult_content', False) else '❌'}", 
-                    callback_data="settings_adult"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    f"🔔 Notifications: {'✅' if settings.get('notifications', True) else '❌'}", 
-                    callback_data="settings_notifications"
-                )
-            ],
-            [
-                InlineKeyboardButton("🔙 Back to Main Menu", callback_data="menu_main")
-            ]
+            [InlineKeyboardButton("🌍 Language", callback_data="settings_language")],
+            [InlineKeyboardButton("🔔 Notifications", callback_data="settings_notifications")],
+            [InlineKeyboardButton("🔞 Content Filters", callback_data="settings_content")]
         ]
-        
         reply_markup = InlineKeyboardMarkup(keyboard)
-        message_text = "⚙️ *Settings*\nCustomize your movie bot experience:"
-        
-        if isinstance(update, Update):
-            await update.message.reply_text(message_text, reply_markup=reply_markup, parse_mode='Markdown')
-        else:
-            await update.edit_message_text(message_text, reply_markup=reply_markup, parse_mode='Markdown')
-
-    async def handle_settings_callback(self, query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE):
-        """Handle settings-related callbacks"""
-        user_id = str(query.from_user.id)
-        settings = self.data_manager.get_settings(user_id)
-        setting_type = query.data.split('_')[1]
-
-        if setting_type == 'language':
-            # Toggle between 'en' and 'es' (you can add more languages)
-            current_lang = settings.get('language', 'en')
-            settings['language'] = 'es' if current_lang == 'en' else 'en'
-            
-        elif setting_type == 'adult':
-            # Toggle adult content
-            settings['adult_content'] = not settings.get('adult_content', False)
-            
-        elif setting_type == 'notifications':
-            # Toggle notifications
-            settings['notifications'] = not settings.get('notifications', True)
-
-        # Save updated settings
-        self.data_manager.update_settings(user_id, settings)
-        
-        # Show updated settings menu
-        await self.settings_command(query, context)
-        await query.answer(f"Setting updated!")
+        await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
 
     async def handle_inline_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle inline queries for movie/show searches"""
@@ -816,102 +771,167 @@ class MovieBot:
         except Exception as e:
             logger.error(f"Error sending error message: {e}")
 
-    async def handle_menu_selection(self, query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE):
-        """Handle main menu button selections"""
-        menu_type = query.data.split('_')[1]
-
+    async def send_rich_media_message(self, update: Update, content_type: str, content_data: dict):
+        """Send enhanced messages with rich media content"""
         try:
-            if menu_type == 'trending':
-                await self.trending_command(query, context)
-            elif menu_type == 'nowplaying':
-                await self.now_playing_command(query, context)
-            elif menu_type == 'upcoming':
-                await self.upcoming_command(query, context)
-            elif menu_type == 'mylist':
-                await self.my_list_command(query, context)
-            elif menu_type == 'settings':
-                await self.settings_command(query, context)
-            elif menu_type == 'help':
-                await self.help_command(query, context)
-            elif menu_type == 'main':
-                # Return to main menu
-                await self.start_command(query, context)
+            if content_type == "movie_preview":
+                # Send movie trailer or clip as video if available
+                if content_data.get('video_url'):
+                    await update.message.reply_video(
+                        video=content_data['video_url'],
+                        caption=content_data['caption'],
+                        parse_mode='Markdown'
+                    )
+                # Send multiple images in a media group
+                elif content_data.get('images'):
+                    media_group = [
+                        InputMediaPhoto(media=img_url) 
+                        for img_url in content_data['images'][:10]
+                    ]
+                    await update.message.reply_media_group(media=media_group)
             
-            await query.answer()
+            elif content_type == "welcome":
+                # Send welcome GIF
+                await update.message.reply_animation(
+                    animation="https://example.com/welcome.gif",
+                    caption="Welcome to Cinephiles Bot! 🎬",
+                    parse_mode='Markdown'
+                )
         except Exception as e:
-            logger.error(f"Error in menu selection: {e}")
-            await query.answer("An error occurred. Please try again.")
+            logger.error(f"Error sending rich media: {e}")
+            await self.error_handler(update, None)
 
-    async def format_content_details(self, content: dict, content_type: str) -> str:
-        """Format content details with rich information"""
-        # Get title or name with proper nested get
-        title = content.get('title') or content.get('name', 'N/A')
-        text = f"*{title}*\n\n"
+    async def handle_feedback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle user feedback and bug reports"""
+        feedback_text = update.message.text
+        user = update.effective_user
         
-        # Release date/year
-        release_date = content.get('release_date') or content.get('first_air_date', 'N/A')
-        if release_date and release_date != 'N/A':
-            year = release_date.split('-')[0]
-            text += f"📅 *Year:* {year}\n"
-
-        # Rating
-        rating = content.get('vote_average', 0)
-        vote_count = content.get('vote_count', 0)
-        if rating and vote_count:
-            stars = '⭐' * round(rating/2)
-            text += f"*Rating:* {rating}/10 {stars} ({vote_count:,} votes)\n"
-
-        # Genres
-        genres = content.get('genres', [])
-        if genres:
-            genre_names = ', '.join(g['name'] for g in genres)
-            text += f"🎭 *Genres:* {genre_names}\n"
-
-        # Runtime/Episodes
-        if content_type == 'movie':
-            runtime = content.get('runtime')
-            if runtime:
-                text += f"⏱️ *Runtime:* {runtime} minutes\n"
-        elif content_type == 'tv':
-            seasons = content.get('number_of_seasons', 'N/A')
-            episodes = content.get('number_of_episodes', 'N/A')
-            text += f"📺 *Seasons:* {seasons} | *Episodes:* {episodes}\n"
-
-        # Overview
-        overview = content.get('overview', '')
-        if overview:
-            text += f"\n📝 *Overview:*\n{overview}\n"
-
-        # Status
-        status = content.get('status', '')
-        if status:
-            text += f"\n📊 *Status:* {status}\n"
-
-        return text
-
-    async def cleanup_sessions(self, context: ContextTypes.DEFAULT_TYPE):
-        """Periodic cleanup of old sessions"""
-        self.session_manager.cleanup_old_sessions()
-
-    async def handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Generic command handler with rate limiting"""
-        user_id = update.effective_user.id
+        # Anonymize user data
+        anonymous_user_id = self.anonymize_data(str(user.id))
         
-        if not self.rate_limiter.can_proceed(user_id):
-            await update.message.reply_text(
-                "⚠️ You're making too many requests. Please wait a moment.",
-                parse_mode='Markdown'
-            )
-            return False
+        feedback_entry = {
+            'user_id': anonymous_user_id,
+            'timestamp': datetime.now().isoformat(),
+            'feedback': feedback_text,
+            'type': context.user_data.get('feedback_type', 'general')
+        }
         
-        self.session_manager.update_activity(user_id)
-        return True
+        # Store feedback in database (implement your database logic here)
+        # self.db.store_feedback(feedback_entry)
+        
+        await update.message.reply_text(
+            "Thank you for your feedback! We appreciate your help in improving our service.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📝 Send More Feedback", callback_data="feedback_new")
+            ]])
+        )
+
+    async def setup_notifications(self):
+        """Setup periodic notifications for users"""
+        async def check_and_send_notifications():
+            for user_id, user_data in self.user_data.items():
+                if user_data.get('preferences', {}).get('notifications', True):
+                    # Check for new releases in watchlist
+                    for movie_id in user_data.get('watchlist', []):
+                        movie_data = await self.fetch_tmdb_data(f"/movie/{movie_id}")
+                        release_date = datetime.strptime(
+                            movie_data.get('release_date', ''), 
+                            '%Y-%m-%d'
+                        )
+                        
+                        if release_date and release_date - datetime.now() <= timedelta(days=7):
+                            await self.application.bot.send_message(
+                                chat_id=user_id,
+                                text=f"🎬 Upcoming Release Alert!\n\n"
+                                     f"'{movie_data['title']}' is releasing on {release_date.strftime('%B %d, %Y')}!"
+                            )
+
+        # Run notifications check every 24 hours
+        schedule.every(24).hours.do(lambda: asyncio.run(check_and_send_notifications()))
+
+    async def share_watchlist(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Share watchlist with other users"""
+        user_watchlist = context.user_data.get('watchlist', [])
+        if not user_watchlist:
+            await update.message.reply_text("Your watchlist is empty!")
+            return
+
+        # Create shareable watchlist message
+        watchlist_text = "🎬 *My Cinephiles Watchlist*\n\n"
+        for movie_id in user_watchlist:
+            movie_data = await self.fetch_tmdb_data(f"/movie/{movie_id}")
+            if movie_data:
+                watchlist_text += f"• {movie_data['title']}\n"
+
+        # Create share button
+        share_button = InlineKeyboardButton(
+            "Share Watchlist",
+            switch_inline_query=f"share_watchlist_{update.effective_user.id}"
+        )
+        reply_markup = InlineKeyboardMarkup([[share_button]])
+
+        await update.message.reply_text(
+            watchlist_text,
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
+
+    def anonymize_data(self, data: str) -> str:
+        """Anonymize user data using SHA-256 hashing"""
+        return hashlib.sha256(data.encode()).hexdigest()
+
+    async def show_user_guide(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Display comprehensive user guide"""
+        guide_text = """
+🎬 *Welcome to Cinephiles Bot User Guide*
+
+*Basic Commands:*
+/start - Start the bot
+/help - Show this guide
+/trending - View trending content
+/upcoming - Check upcoming releases
+/nowplaying - See what's in theaters
+/mylist - Access your watchlist
+/settings - Customize preferences
+
+*Search Features:*
+• Simply type any movie or show name
+• Use inline mode by typing @YourBotName in any chat
+
+*Watchlist Management:*
+• Save movies/shows using 📌 button
+• Share your watchlist with friends
+• Get notifications for new releases
+
+*Customization:*
+• Set your preferred language
+• Enable/disable notifications
+• Adjust content filters
+
+*Feedback & Support:*
+• Use /feedback to report issues
+"""
+        await update.message.reply_text(
+            guide_text,
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📝 Send Feedback", callback_data="feedback_new")
+            ]])
+        )
+
+    # Monitoring metrics
+    SEARCH_LATENCY = Histogram('search_latency_seconds', 'Search request latency')
+    API_REQUESTS = Counter('tmdb_api_requests_total', 'Total TMDB API requests')
+    ERROR_COUNT = Counter('bot_errors_total', 'Total number of bot errors')
 
     def run(self):
         """Run the bot and web server"""
         self.start_time = datetime.now()
         
         async def start():
+            # Start notification system
+            await self.setup_notifications()
+            
             # Start web server
             runner = web.AppRunner(await self.web_app())
             await runner.setup()
@@ -927,6 +947,7 @@ class MovieBot:
             
             # Keep the application running indefinitely
             while True:
+                schedule.run_pending()  # Run scheduled tasks
                 await asyncio.sleep(1)
 
         # Run the async function
