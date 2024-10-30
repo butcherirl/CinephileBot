@@ -844,10 +844,12 @@ class MovieBot:
 
     async def format_content_details(self, content: dict, content_type: str) -> str:
         """Format content details with rich information"""
-        text = f"*{content.get('title', content.get('name', 'N/A')}*\n\n"
+        # Get title or name with proper nested get
+        title = content.get('title') or content.get('name', 'N/A')
+        text = f"*{title}*\n\n"
         
         # Release date/year
-        release_date = content.get('release_date', content.get('first_air_date', 'N/A'))
+        release_date = content.get('release_date') or content.get('first_air_date', 'N/A')
         if release_date and release_date != 'N/A':
             year = release_date.split('-')[0]
             text += f"📅 *Year:* {year}\n"
@@ -860,25 +862,30 @@ class MovieBot:
             text += f"*Rating:* {rating}/10 {stars} ({vote_count:,} votes)\n"
 
         # Genres
-        if content.get('genres'):
-            genres = ', '.join([g['name'] for g in content['genres']])
-            text += f"🎭 *Genres:* {genres}\n"
+        genres = content.get('genres', [])
+        if genres:
+            genre_names = ', '.join(g['name'] for g in genres)
+            text += f"🎭 *Genres:* {genre_names}\n"
 
         # Runtime/Episodes
-        if content_type == 'movie' and content.get('runtime'):
-            text += f"⏱️ *Runtime:* {content['runtime']} minutes\n"
+        if content_type == 'movie':
+            runtime = content.get('runtime')
+            if runtime:
+                text += f"⏱️ *Runtime:* {runtime} minutes\n"
         elif content_type == 'tv':
             seasons = content.get('number_of_seasons', 'N/A')
             episodes = content.get('number_of_episodes', 'N/A')
             text += f"📺 *Seasons:* {seasons} | *Episodes:* {episodes}\n"
 
         # Overview
-        if content.get('overview'):
-            text += f"\n📝 *Overview:*\n{content['overview']}\n"
+        overview = content.get('overview', '')
+        if overview:
+            text += f"\n📝 *Overview:*\n{overview}\n"
 
-        # Additional info
-        if content.get('status'):
-            text += f"\n📊 *Status:* {content['status']}\n"
+        # Status
+        status = content.get('status', '')
+        if status:
+            text += f"\n📊 *Status:* {status}\n"
 
         return text
 
